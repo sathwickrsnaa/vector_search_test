@@ -7,45 +7,40 @@ import pickle
 import streamlit as st
 import pandas as pd
 import io
+import networkx as nx
 
-# ==============================================================================
-# VectorSearch Class (Your Original Code)
-# ==============================================================================
+
 
 class VectorSearch:
     """
-    A class for performing optimized similarity search on sentence embeddings.
+    A class for performing optimized similarity search and clustering on sentence embeddings.
     """
     def __init__(self, model_name='all-MiniLM-L6-v2'):
-        # Initialize the sentence transformer model
         self.model = SentenceTransformer(model_name)
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
         self.index = None
         self.sentences = []
+        self.embeddings = None
 
     def build_index(self, sentences, nlist=2):
         """Builds an optimized FAISS index from a list of sentences."""
         st.write(f"\nBuilding index for {len(sentences)} sentences...")
         self.sentences = sentences
 
-        # 1. Create embeddings
         start_time = time.time()
         with st.spinner('Creating embeddings... This may take a moment.'):
-            embeddings = self.model.encode(self.sentences, show_progress_bar=True, convert_to_numpy=True)
+            self.embeddings = self.model.encode(self.sentences, show_progress_bar=True, convert_to_numpy=True).astype('float32')
         st.success(f"Embeddings created in {time.time() - start_time:.2f} seconds.")
 
-        # 2. Create an optimized FAISS index (IndexIVFFlat)
         quantizer = faiss.IndexFlatL2(self.embedding_dim)
         self.index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist, faiss.METRIC_L2)
 
-        # 3. Train the index
         start_time = time.time()
         with st.spinner('Training the FAISS index...'):
-            self.index.train(embeddings.astype('float32'))
+            self.index.train(self.embeddings)
         st.success(f"Index trained in {time.time() - start_time:.2f} seconds.")
 
-        # 4. Add the embeddings to the index
-        self.index.add(embeddings.astype('float32'))
+        self.index.add(self.embeddings)
         st.success(f"Successfully added {self.index.ntotal} vectors to the index.")
 
     def search(self, query_text, k=5, nprobe=2):
@@ -63,9 +58,49 @@ class VectorSearch:
         distances, indices = self.index.search(query_vector.astype('float32'), k)
         results = []
         for i, idx in enumerate(indices[0]):
-            if idx != -1: # FAISS returns -1 for no result
+            if idx != -1:
                 results.append((self.sentences[idx], distances[0][i]))
         return results
+
+    # --- UPDATED METHOD ---
+    def find_similarity_clusters(self, threshold, k=10, nprobe=2):
+        """
+        Groups sentences into clusters based on a similarity threshold.
+        If A is similar to B, and B is similar to C, all three are in the same cluster.
+
+        Args:
+            threshold (float): The maximum L2 distance to be considered similar.
+            k (int): The number of neighbors to search for each sentence.
+            nprobe (int): The number of nearby cells to search.
+
+        Returns:
+            list: A list of clusters, where each cluster is a list of sentences.
+        """
+        if self.index is None or self.embeddings is None:
+            raise RuntimeError("Index has not been built. Please call `build_index` first.")
+
+        self.index.nprobe = nprobe
+        # Search for the k nearest neighbors of every vector in the index
+        distances, indices = self.index.search(self.embeddings, k)
+
+        # Create a graph
+        G = nx.Graph()
+        all_sentences = list(self.sentences)
+        G.add_nodes_from(all_sentences)
+
+        # Add edges between similar sentences
+        for i in range(len(all_sentences)):
+            for j_idx, dist in zip(indices[i], distances[i]):
+                if i != j_idx and dist < threshold:
+                    G.add_edge(all_sentences[i], all_sentences[j_idx])
+
+        # Find connected components (the clusters)
+        clusters = list(nx.connected_components(G))
+        
+        # Filter out single-member clusters
+        clusters = [list(c) for c in clusters if len(c) > 1]
+        
+        return clusters
 
     def save_index(self, path="my_faiss_index"):
         """Saves the FAISS index and sentences to a directory."""
@@ -83,16 +118,17 @@ class VectorSearch:
         self.index = faiss.read_index(os.path.join(path, "index.faiss"))
         with open(os.path.join(path, "sentences.pkl"), "rb") as f:
             self.sentences = pickle.load(f)
-        # Ensure embedding_dim is set after loading
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
+        with st.spinner("Preparing embeddings for loaded index..."):
+            self.embeddings = self.model.encode(self.sentences, show_progress_bar=False, convert_to_numpy=True).astype('float32')
         st.success(f"Index with {self.index.ntotal} vectors loaded successfully.")
 
 # ==============================================================================
-# Streamlit Web App
+# Streamlit Web App (Updated)
 # ==============================================================================
 
 st.set_page_config(layout="wide")
-st.title("🔎 FAISS-Powered Vector Search Engine")
+st.title("🔎 FAISS-Powered Vector Search & Discovery Engine")
 
 # --- Initialize session state ---
 if 'vector_search' not in st.session_state:
@@ -102,18 +138,15 @@ if 'vector_search' not in st.session_state:
 if 'sentences_from_csv' not in st.session_state:
     st.session_state.sentences_from_csv = ""
 
-
 # --- Sidebar for controls ---
 with st.sidebar:
     st.header("Controls")
 
-    # Option to load an existing index
     st.subheader("Load Existing Index")
     index_path_to_load = st.text_input("Index Directory to Load", "my_faiss_index")
     if st.button("Load Index"):
         try:
             st.session_state.vector_search.load_index(index_path_to_load)
-            # When loading an index, clear any sentences from a previous CSV upload
             st.session_state.sentences_from_csv = "\n".join(st.session_state.vector_search.sentences)
         except FileNotFoundError as e:
             st.error(str(e))
@@ -122,34 +155,26 @@ with st.sidebar:
 
     st.divider()
 
-    # Option to build a new index
     st.subheader("Build a New Index")
-
-    # --- NEW: CSV Uploader ---
     uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
     if uploaded_file is not None:
         try:
-            # To read file as string:
             stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
             df = pd.read_csv(stringio)
-            
-            # Check for 'sentences' column
             if "sentences" in df.columns:
-                # Convert column to a list of strings and join them with newlines
                 sentences_list = df["sentences"].astype(str).tolist()
                 st.session_state.sentences_from_csv = "\n".join(sentences_list)
                 st.success(f"Successfully loaded {len(sentences_list)} sentences from CSV.")
             else:
                 st.error("Error: The CSV file must contain a column named 'sentences'.")
-                st.session_state.sentences_from_csv = "" # Clear previous data on error
+                st.session_state.sentences_from_csv = ""
         except Exception as e:
             st.error(f"An error occurred while processing the CSV file: {e}")
             st.session_state.sentences_from_csv = ""
 
-
     sentences_input = st.text_area(
         "Enter sentences (one per line) or upload a CSV",
-        value=st.session_state.sentences_from_csv, # Use session state to pre-fill
+        value=st.session_state.sentences_from_csv,
         placeholder="The cat sat on the mat.\nThe dog chased the cat.",
         height=250
     )
@@ -164,7 +189,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Option to save the current index
     st.subheader("Save Current Index")
     index_path_to_save = st.text_input("Index Directory to Save", "my_faiss_index")
     if st.button("Save Index"):
@@ -173,39 +197,58 @@ with st.sidebar:
         else:
             st.warning("No index has been built or loaded yet.")
 
-
-# --- Main content area for search ---
-st.header("Perform a Search")
-
+# --- Main content area ---
 if st.session_state.vector_search.index is None:
     st.info("Please build or load an index using the controls in the sidebar.")
 else:
     st.success(f"**Index is ready!** It contains {st.session_state.vector_search.index.ntotal} sentences.")
 
-    query_text = st.text_input("Enter your search query:", "a domestic animal")
-
     col1, col2 = st.columns(2)
+
     with col1:
-        k = st.slider("Number of results (k)", 1, 10, 5)
-    with col2:
-        # Ensure nprobe doesn't exceed nlist
+        st.header("1. Perform a Search")
+        query_text = st.text_input("Enter your search query:", "a domestic animal")
+        k_search = st.slider("Number of results (k)", 1, 10, 5, key="k_search")
         max_nprobe = st.session_state.vector_search.index.nlist
-        nprobe = st.slider("Clusters to search (nprobe)", 1, max_nprobe, min(1, max_nprobe))
+        nprobe_search = st.slider("Clusters to search (nprobe)", 1, max_nprobe, min(1, max_nprobe), key="nprobe_search")
 
-
-    if st.button("Search"):
-        if query_text:
-            start_time = time.time()
-            results = st.session_state.vector_search.search(query_text, k=k, nprobe=nprobe)
-            end_time = time.time()
-
-            st.write(f"Search completed in {end_time - start_time:.4f} seconds.")
-            st.subheader("Search Results")
-
-            if results:
-                for sentence, distance in results:
-                    st.write(f"- **Sentence:** *{sentence}* \n  - **Distance:** `{distance:.4f}`")
+        if st.button("Search"):
+            if query_text:
+                start_time = time.time()
+                results = st.session_state.vector_search.search(query_text, k=k_search, nprobe=nprobe_search)
+                end_time = time.time()
+                st.write(f"Search completed in {end_time - start_time:.4f} seconds.")
+                st.subheader("Search Results")
+                if results:
+                    for sentence, distance in results:
+                        st.write(f"- **Sentence:** *{sentence}* \n  - **Distance:** `{distance:.4f}`")
+                else:
+                    st.write("No results found.")
             else:
-                st.write("No results found.")
-        else:
-            st.warning("Please enter a search query.")
+                st.warning("Please enter a search query.")
+
+    # --- UPDATED UI SECTION ---
+    with col2:
+        st.header("2. Find Similarity Clusters")
+        help_text = "L2 distance. A smaller value (e.g., < 0.5) means higher similarity. A value too high may return too many results."
+        similarity_threshold = st.number_input(
+            "Similarity Threshold",
+            min_value=0.0, max_value=2.0, value=0.75, step=0.05, help=help_text
+        )
+        
+        if st.button("Find Clusters"):
+            with st.spinner("Finding clusters... This might take a moment."):
+                start_time = time.time()
+                clusters = st.session_state.vector_search.find_similarity_clusters(threshold=similarity_threshold)
+                end_time = time.time()
+
+            st.write(f"Clustering completed in {end_time - start_time:.4f} seconds.")
+            st.subheader(f"Found {len(clusters)} Clusters")
+
+            if clusters:
+                for i, cluster in enumerate(clusters):
+                    with st.expander(f"Cluster {i+1} ({len(cluster)} sentences)"):
+                        for sentence in cluster:
+                            st.markdown(f"- *{sentence}*")
+            else:
+                st.info("No clusters found with more than one member. Try increasing the threshold.")
