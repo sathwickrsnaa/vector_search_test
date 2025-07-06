@@ -9,9 +9,7 @@ import pandas as pd
 import io
 import networkx as nx
 
-# ==============================================================================
-# VectorSearch Class (Updated)
-# ==============================================================================
+
 
 class VectorSearch:
     """
@@ -30,8 +28,20 @@ class VectorSearch:
         self.sentences = sentences
 
         start_time = time.time()
-        with st.spinner('Creating embeddings... This may take a moment.'):
-            self.embeddings = self.model.encode(self.sentences, show_progress_bar=True, convert_to_numpy=True).astype('float32')
+        
+        st.write("Creating embeddings...")
+        progress_bar = st.progress(0)
+        all_embeddings = []
+        batch_size = 32 # Process sentences in batches
+        for i in range(0, len(self.sentences), batch_size):
+            batch = self.sentences[i:i+batch_size]
+            embeddings_batch = self.model.encode(batch, convert_to_numpy=True)
+            all_embeddings.append(embeddings_batch)
+            progress_percentage = min((i + batch_size) / len(self.sentences), 1.0)
+            progress_bar.progress(progress_percentage)
+
+        self.embeddings = np.vstack(all_embeddings).astype('float32')
+        progress_bar.empty() # Remove the progress bar after completion
         st.success(f"Embeddings created in {time.time() - start_time:.2f} seconds.")
 
         quantizer = faiss.IndexFlatL2(self.embedding_dim)
@@ -64,20 +74,9 @@ class VectorSearch:
                 results.append((self.sentences[idx], distances[0][i]))
         return results
 
-    # --- UPDATED METHOD ---
     def find_similarity_clusters(self, threshold, k=10, nprobe=2):
         """
         Groups sentences into clusters based on a similarity threshold.
-
-        Args:
-            threshold (float): The maximum L2 distance to be considered similar.
-            k (int): The number of neighbors to search for each sentence.
-            nprobe (int): The number of nearby cells to search.
-
-        Returns:
-            tuple: A tuple containing:
-                - list: A list of clusters (each cluster is a list of sentences).
-                - pd.DataFrame: A DataFrame with 'sentence' and 'cluster_id' columns.
         """
         if self.index is None or self.embeddings is None:
             raise RuntimeError("Index has not been built. Please call `build_index` first.")
@@ -96,9 +95,7 @@ class VectorSearch:
 
         clusters = list(nx.connected_components(G))
         
-        # Create the export data
         sentence_to_cluster_id = {}
-        # Assign sentences in multi-member clusters an ID
         multi_member_clusters = []
         cluster_id_counter = 0
         for component in clusters:
@@ -108,12 +105,10 @@ class VectorSearch:
                     sentence_to_cluster_id[sentence] = cluster_id_counter
                 cluster_id_counter += 1
         
-        # Assign sentences not in any cluster an ID of -1
         for sentence in all_sentences:
             if sentence not in sentence_to_cluster_id:
                 sentence_to_cluster_id[sentence] = -1
         
-        # Create DataFrame for export
         export_df = pd.DataFrame(sentence_to_cluster_id.items(), columns=['sentence', 'cluster_id'])
         
         return multi_member_clusters, export_df
@@ -135,8 +130,20 @@ class VectorSearch:
         with open(os.path.join(path, "sentences.pkl"), "rb") as f:
             self.sentences = pickle.load(f)
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
-        with st.spinner("Preparing embeddings for loaded index..."):
-            self.embeddings = self.model.encode(self.sentences, show_progress_bar=False, convert_to_numpy=True).astype('float32')
+        
+        st.write("Preparing embeddings for loaded index...")
+        progress_bar = st.progress(0)
+        all_embeddings = []
+        batch_size = 32
+        for i in range(0, len(self.sentences), batch_size):
+            batch = self.sentences[i:i+batch_size]
+            embeddings_batch = self.model.encode(batch, convert_to_numpy=True)
+            all_embeddings.append(embeddings_batch)
+            progress_percentage = min((i + batch_size) / len(self.sentences), 1.0)
+            progress_bar.progress(progress_percentage)
+            
+        self.embeddings = np.vstack(all_embeddings).astype('float32')
+        progress_bar.empty()
         st.success(f"Index with {self.index.ntotal} vectors loaded successfully.")
 
 # ==============================================================================
@@ -144,7 +151,19 @@ class VectorSearch:
 # ==============================================================================
 
 st.set_page_config(layout="wide")
-st.title("🔎 FAISS-Powered Vector Search & Discovery Engine")
+
+# --- NEW: Title, Caption, and Description ---
+st.title("🚀 Newtelligence")
+st.caption("Search, Connect, Discover")
+st.markdown("""
+Welcome to **Newtelligence**, your intelligent tool for text analysis. This application leverages the power of sentence embeddings and high-speed vector search to unlock insights from your text data.
+
+**What you can do:**
+- **Build or Load an Index:** Convert your sentences into a searchable, high-performance index.
+- **Semantic Search:** Find sentences that are most similar to your query, not just by keywords, but by meaning.
+- **Discover Clusters:** Automatically group related sentences into thematic clusters based on a similarity threshold you control.
+""")
+
 
 # --- Initialize session state ---
 if 'vector_search' not in st.session_state:
@@ -153,7 +172,6 @@ if 'vector_search' not in st.session_state:
     st.success("Model loaded successfully.")
 if 'sentences_from_csv' not in st.session_state:
     st.session_state.sentences_from_csv = ""
-# --- NEW: Session state for cluster results ---
 if 'cluster_export_data' not in st.session_state:
     st.session_state.cluster_export_data = None
 
@@ -249,7 +267,6 @@ else:
             else:
                 st.warning("Please enter a search query.")
 
-    # --- UPDATED UI SECTION ---
     with col2:
         st.header("2. Find Similarity Clusters")
         help_text = "L2 distance. A smaller value (e.g., < 0.5) means higher similarity. A value too high may return too many results."
@@ -263,21 +280,36 @@ else:
                 start_time = time.time()
                 clusters, export_df = st.session_state.vector_search.find_similarity_clusters(threshold=similarity_threshold)
                 end_time = time.time()
-                # Store export data in session state
                 st.session_state.cluster_export_data = export_df.to_csv(index=False).encode('utf-8')
 
             st.write(f"Clustering completed in {end_time - start_time:.4f} seconds.")
+            
+            # --- NEW: Logic to handle > 500 clusters and display unassigned ---
+            clusters.sort(key=len, reverse=True) # Sort by size
+            
             st.subheader(f"Found {len(clusters)} Clusters")
 
-            if clusters:
-                for i, cluster in enumerate(clusters):
+            clusters_to_display = clusters
+            if len(clusters) > 500:
+                st.info(f"Displaying the top 100 largest clusters out of {len(clusters)} found.")
+                clusters_to_display = clusters[:100]
+
+            if clusters_to_display:
+                for i, cluster in enumerate(clusters_to_display):
                     with st.expander(f"Cluster {i} ({len(cluster)} sentences)"):
                         for sentence in cluster:
                             st.markdown(f"- *{sentence}*")
             else:
                 st.info("No clusters found with more than one member. Try increasing the threshold.")
+            
+            # Display unassigned sentences
+            unassigned_sentences = export_df[export_df['cluster_id'] == -1]['sentence'].tolist()
+            if unassigned_sentences:
+                with st.expander(f"Unassigned Sentences ({len(unassigned_sentences)} sentences)"):
+                    for sentence in unassigned_sentences:
+                        st.markdown(f"- *{sentence}*")
 
-        # --- NEW: Download Button ---
+
         if st.session_state.cluster_export_data is not None:
             st.download_button(
                label="Download Clusters as CSV",
