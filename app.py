@@ -9,7 +9,9 @@ import pandas as pd
 import io
 import networkx as nx
 
-
+# ==============================================================================
+# VectorSearch Class (Updated)
+# ==============================================================================
 
 class VectorSearch:
     """
@@ -66,7 +68,6 @@ class VectorSearch:
     def find_similarity_clusters(self, threshold, k=10, nprobe=2):
         """
         Groups sentences into clusters based on a similarity threshold.
-        If A is similar to B, and B is similar to C, all three are in the same cluster.
 
         Args:
             threshold (float): The maximum L2 distance to be considered similar.
@@ -74,33 +75,48 @@ class VectorSearch:
             nprobe (int): The number of nearby cells to search.
 
         Returns:
-            list: A list of clusters, where each cluster is a list of sentences.
+            tuple: A tuple containing:
+                - list: A list of clusters (each cluster is a list of sentences).
+                - pd.DataFrame: A DataFrame with 'sentence' and 'cluster_id' columns.
         """
         if self.index is None or self.embeddings is None:
             raise RuntimeError("Index has not been built. Please call `build_index` first.")
 
         self.index.nprobe = nprobe
-        # Search for the k nearest neighbors of every vector in the index
         distances, indices = self.index.search(self.embeddings, k)
 
-        # Create a graph
         G = nx.Graph()
         all_sentences = list(self.sentences)
         G.add_nodes_from(all_sentences)
 
-        # Add edges between similar sentences
         for i in range(len(all_sentences)):
             for j_idx, dist in zip(indices[i], distances[i]):
                 if i != j_idx and dist < threshold:
                     G.add_edge(all_sentences[i], all_sentences[j_idx])
 
-        # Find connected components (the clusters)
         clusters = list(nx.connected_components(G))
         
-        # Filter out single-member clusters
-        clusters = [list(c) for c in clusters if len(c) > 1]
+        # Create the export data
+        sentence_to_cluster_id = {}
+        # Assign sentences in multi-member clusters an ID
+        multi_member_clusters = []
+        cluster_id_counter = 0
+        for component in clusters:
+            if len(component) > 1:
+                multi_member_clusters.append(list(component))
+                for sentence in component:
+                    sentence_to_cluster_id[sentence] = cluster_id_counter
+                cluster_id_counter += 1
         
-        return clusters
+        # Assign sentences not in any cluster an ID of -1
+        for sentence in all_sentences:
+            if sentence not in sentence_to_cluster_id:
+                sentence_to_cluster_id[sentence] = -1
+        
+        # Create DataFrame for export
+        export_df = pd.DataFrame(sentence_to_cluster_id.items(), columns=['sentence', 'cluster_id'])
+        
+        return multi_member_clusters, export_df
 
     def save_index(self, path="my_faiss_index"):
         """Saves the FAISS index and sentences to a directory."""
@@ -137,6 +153,10 @@ if 'vector_search' not in st.session_state:
     st.success("Model loaded successfully.")
 if 'sentences_from_csv' not in st.session_state:
     st.session_state.sentences_from_csv = ""
+# --- NEW: Session state for cluster results ---
+if 'cluster_export_data' not in st.session_state:
+    st.session_state.cluster_export_data = None
+
 
 # --- Sidebar for controls ---
 with st.sidebar:
@@ -148,6 +168,7 @@ with st.sidebar:
         try:
             st.session_state.vector_search.load_index(index_path_to_load)
             st.session_state.sentences_from_csv = "\n".join(st.session_state.vector_search.sentences)
+            st.session_state.cluster_export_data = None # Reset export data
         except FileNotFoundError as e:
             st.error(str(e))
         except Exception as e:
@@ -184,6 +205,7 @@ with st.sidebar:
         sentences = [s.strip() for s in sentences_input.split('\n') if s.strip()]
         if sentences:
             st.session_state.vector_search.build_index(sentences, nlist=nlist)
+            st.session_state.cluster_export_data = None # Reset export data
         else:
             st.warning("Please enter at least one sentence or upload a valid CSV.")
 
@@ -239,16 +261,27 @@ else:
         if st.button("Find Clusters"):
             with st.spinner("Finding clusters... This might take a moment."):
                 start_time = time.time()
-                clusters = st.session_state.vector_search.find_similarity_clusters(threshold=similarity_threshold)
+                clusters, export_df = st.session_state.vector_search.find_similarity_clusters(threshold=similarity_threshold)
                 end_time = time.time()
+                # Store export data in session state
+                st.session_state.cluster_export_data = export_df.to_csv(index=False).encode('utf-8')
 
             st.write(f"Clustering completed in {end_time - start_time:.4f} seconds.")
             st.subheader(f"Found {len(clusters)} Clusters")
 
             if clusters:
                 for i, cluster in enumerate(clusters):
-                    with st.expander(f"Cluster {i+1} ({len(cluster)} sentences)"):
+                    with st.expander(f"Cluster {i} ({len(cluster)} sentences)"):
                         for sentence in cluster:
                             st.markdown(f"- *{sentence}*")
             else:
                 st.info("No clusters found with more than one member. Try increasing the threshold.")
+
+        # --- NEW: Download Button ---
+        if st.session_state.cluster_export_data is not None:
+            st.download_button(
+               label="Download Clusters as CSV",
+               data=st.session_state.cluster_export_data,
+               file_name='sentence_clusters.csv',
+               mime='text/csv',
+            )
